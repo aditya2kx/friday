@@ -1,0 +1,5 @@
+pytest>=8
+pyyaml>=6
+google-cloud-bigquery>=3
+google-cloud-secret-manager>=2
+requests>=2

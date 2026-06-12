@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+.coverage
+config.yaml
+registry.json
+*.local.*

@@ -1,0 +1,15 @@
+name: Decision document
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: python scripts/check_decision_doc.py --body "$PR_BODY"
