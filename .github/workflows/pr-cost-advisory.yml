@@ -24,9 +24,6 @@ jobs:
       PR: ${{ github.event.pull_request.number }}
       FRIDAY_BQ_PROJECT: friday-prod-7401
     steps:
-      - name: advisory only
-        run: echo "advisory only"
-
       - name: Register check on main push
         if: github.event_name == 'push'
         run: echo "Cost advisory runs on pull_request only; this registers the check name on main."
