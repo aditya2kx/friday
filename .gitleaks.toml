@@ -1,0 +1,10 @@
+# Gitleaks configuration for FRIDAY repo.
+# Extends the default ruleset; add allowlist entries for documented false positives.
+
+[allowlist]
+description = "Known false positives in documentation"
+paths = [
+  # Milestone spec docs contain shell commands with --secret= flags pointing to
+  # GCP secret *names* (not values). These are not secrets.
+  "docs/milestones/.*\\.md",
+]
