@@ -1,0 +1,17 @@
+name: Rules lint
+on:
+  pull_request:
+    paths:
+      - '.cursor/rules/**'
+      - 'scripts/rules_lint.py'
+  merge_group:
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install pyyaml
+      - run: python scripts/rules_lint.py

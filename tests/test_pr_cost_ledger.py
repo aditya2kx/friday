@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+"""Tests for pr_cost_ledger."""
+
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import pr_cost_ledger as L
+import pr_cost_store as S
+
+
+def _make_in_memory_store_patchers():
+    """Return a patch.multiple patcher that redirects all store I/O to an in-memory dict."""
+    db: dict = {}
+
+    def _save(rec):
+        import json as _json
+        key = S.pr_key(
+            rec.get("pr_number") if rec.get("pr_number") is not None
+            else rec.get("provisional_id")
+        )
+        db[key] = _json.loads(_json.dumps(rec))
+
+    def _load(pr, ef):
+        import json as _json
+        key = S.pr_key(pr)
+        if key in db:
+            return _json.loads(_json.dumps(db[key]))
+        return ef(pr)
+
+    def _all():
+        return sorted(int(k) for k in db if k.isdigit())
+
+    def _delete(pr):
+        db.pop(S.pr_key(pr), None)
+
+    def _find_dup(pr, session_keys):
+        """In-memory duplicate detection: scan db for session_keys on other PRs."""
+        my_key = S.pr_key(pr)
+        dupes = []
+        for k, rec in db.items():
+            if k == my_key:
+                continue
+            for sess in (rec.get("build") or {}).get("sessions") or []:
+                uid = S._session_uid(sess)
+                if uid in session_keys:
+                    dupes.append((k, uid))
+        return dupes
+
+    patcher = patch.multiple(
+        S,
+        save_record=_save,
+        load_record=_load,
+        all_prs=_all,
+        delete_record=_delete,
+        ensure_schema=lambda: None,
+        find_duplicate_sessions=_find_dup,
+    )
+    return patcher, db
+
+
+class TestPrCostLedger(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._orig_dir = L.LEDGER_DIR
+        L.LEDGER_DIR = Path(self._tmpdir.name)
+        self._store_patcher, self._db = _make_in_memory_store_patchers()
+        self._store_patcher.start()
+
+    def tearDown(self):
+        self._store_patcher.stop()
+        L.LEDGER_DIR = self._orig_dir
+        self._tmpdir.cleanup()
+
+    def test_validate_happy_path(self):
+        L.set_meta(1, title="t", requirement="r")
+        L.record_build_session(1, ts="2026-01-01T00:00:00Z", tokens=100, cost_usd=0.5, model="m")
+        ok, problems = L.validate(1, require_build=True)
+        self.assertTrue(ok)
+        self.assertEqual(problems, [])
+
+    def test_validate_no_file(self):
+        ok, problems = L.validate(99)
+        self.assertFalse(ok)
+        self.assertTrue(any("no cost record" in p for p in problems))
+
+    def test_validate_no_requirement_or_title(self):
+        # A record saved with only a title but no requirement (using set_meta)
+        L.set_meta(2, title="only title")
+        ok, problems = L.validate(2)
+        self.assertFalse(ok)
+        # Should fail either on "requirement/title" or "unaccounted" (no cost surfaces)
+        self.assertTrue(
+            any("requirement/title" in p or "unaccounted" in p for p in problems)
+        )
+
+    def test_validate_no_cost_surfaces(self):
+        L.set_meta(3, title="only title")
+        ok, problems = L.validate(3)
+        self.assertFalse(ok)
+        self.assertTrue(any("unaccounted" in p for p in problems))
+
+    def test_validate_require_build_missing(self):
+        L.set_meta(4, title="t")
+        L.record_review_run(
+            4, ts="x", model="claude-sonnet-4-6", turns=1,
+            input_tokens=1, output_tokens=1, cache_read=0, cache_write=0,
+            cost_usd=0.1, result="success", run_url="u",
+        )
+        ok, problems = L.validate(4, require_build=True)
+        self.assertFalse(ok)
+        self.assertTrue(any("no build sessions" in p for p in problems))
+
+    # ── provisional (branch-keyed) sessions + bind-pr ──────────────────────
+    # The PR number is only known once `gh pr create` runs (and parallel chat
+    # spaces compete for it), so a new requirement is tracked by its branch
+    # until then. These guard that flow.
+
+    def test_provisional_record_path_and_key(self):
+        # _record_path is still used for --out default and labels; verify it still resolves
+        self.assertEqual(L._record_path(7).name, "PR-7.json")
+        self.assertEqual(L._record_path("7").name, "PR-7.json")
+        # branch-keyed provisional: path still has the slug form for legacy compat
+        self.assertIn("session", L._record_path("feat/foo-bar").name)
+
+    def test_provisional_record_has_no_pr_number(self):
+        rec = L._empty_record("feat/new-thing")
+        self.assertIsNone(rec["pr_number"])
+        self.assertEqual(rec["provisional_id"], "feat/new-thing")
+
+    def test_all_prs_ignores_provisional(self):
+        L.set_meta(8, title="real")
+        L.set_meta("feat/branchy", title="provisional", requirement="r")
+        # provisional record lives in BQ under branch: key, not in _all_prs() which only returns numeric
+        self.assertEqual(L._all_prs(), [8])
+
+    def test_bind_pr_promotes_provisional_to_number(self):
+        L.set_meta("feat/cool", branch="feat/cool", requirement="do cool",
+                   session_started_at="2026-06-04T03:00:00+00:00")
+        L.bind_pr("feat/cool", pr_number=42)
+        # provisional key removed; numeric key exists with carried-over meta
+        rec = L.load_record(42)
+        self.assertEqual(rec["pr_number"], 42)
+        self.assertIsNone(rec["provisional_id"])
+        self.assertEqual(rec["branch"], "feat/cool")
+        self.assertEqual(rec["requirement"], "do cool")
+        self.assertEqual(rec["session_started_at"], "2026-06-04T03:00:00+00:00")
+        self.assertEqual(L._all_prs(), [42])
+
+    def test_bind_pr_preserves_existing_review_runs(self):
+        # CI may record review cost on PR-<n>.json before bind runs.
+        L.record_review_run(
+            50, ts="2026-06-04T05:00:00Z", model="claude-sonnet-4-6", turns=1,
+            input_tokens=1, output_tokens=1, cache_read=0, cache_write=0,
+            cost_usd=0.2, result="success", run_url="u1",
+        )
+        L.set_meta("feat/late", branch="feat/late", requirement="r")
+        prov = L.load_record("feat/late")
+        prov["build"]["sessions"] = [
+            {"ts": "2026-06-04T03:30:00Z", "model": "m", "tokens": 10, "cost_usd": 1.0}
+        ]
+        L.save_record(prov)
+        L.bind_pr("feat/late", pr_number=50)
+        rec = L.load_record(50)
+        self.assertEqual(len(rec["review"]["runs"]), 1)          # review preserved
+        self.assertEqual(rec["build"]["cost_usd_total"], 1.0)    # build carried over
+        self.assertEqual(rec["requirement"], "r")
+
+    def test_bind_pr_missing_provisional_raises(self):
+        with self.assertRaises(SystemExit) as ctx:
+            L.bind_pr("feat/never-started", pr_number=1)
+        self.assertIn("no provisional", str(ctx.exception))
+
+    def test_capture_build_rejects_partial_window(self):
+        L.set_meta(10, title="t", branch="feat/x")
+        with self.assertRaises(SystemExit) as ctx:
+            L.capture_build(10, start="2026-06-01T00:00:00Z", end=None)
+        self.assertIn("together", str(ctx.exception))
+
+    def test_record_review_run_round_trip(self):
+        L.record_review_run(
+            5, ts="2026-06-01T12:00:00Z", model="claude-sonnet-4-6", turns=7,
+            input_tokens=10, output_tokens=100, cache_read=1000, cache_write=200,
+            cost_usd=0.55, result="success", run_url="https://x/r/1",
+        )
+        rec = L.load_record(5)
+        self.assertEqual(rec["review"]["run_count"], 1)
+        run = rec["review"]["runs"][0]
+        self.assertEqual(run["tokens"], 1310)
+        self.assertEqual(run["cost_usd"], 0.55)
+        self.assertEqual(rec["totals"]["cost_usd"], 0.55)
+
+    def test_record_review_run_dedup_by_run_url(self):
+        kw = dict(
+            ts="2026-06-01T12:00:00Z", model="claude-sonnet-4-6", turns=7,
+            input_tokens=10, output_tokens=100, cache_read=0, cache_write=0,
+            cost_usd=0.55, result="success", run_url="https://x/r/1",
+        )
+        L.record_review_run(6, **kw)
+        L.record_review_run(6, **kw)
+        self.assertEqual(L.load_record(6)["review"]["run_count"], 1)
+
+    def test_record_review_run_dedup_by_ts_when_no_run_url(self):
+        kw = dict(
+            ts="2026-06-01T12:00:00Z", model="claude-sonnet-4-6", turns=7,
+            input_tokens=10, output_tokens=100, cache_read=0, cache_write=0,
+            cost_usd=0.55, result="success", run_url=None,
+        )
+        L.record_review_run(7, **kw)
+        L.record_review_run(7, **kw)
+        self.assertEqual(L.load_record(7)["review"]["run_count"], 1)
+
+    def test_recompute_totals_build_and_review(self):
+        L.record_build_session(8, ts="a", tokens=1000, cost_usd=1.0, model="opus")
+        L.record_build_session(8, ts="b", tokens=500, cost_usd=0.5, model="opus")
+        L.record_review_run(
+            8, ts="c", model="sonnet", turns=1,
+            input_tokens=1, output_tokens=1, cache_read=98, cache_write=0,
+            cost_usd=0.25, result="success", run_url="u",
+        )
+        rec = L.load_record(8)
+        self.assertEqual(rec["build"]["tokens_total"], 1500)
+        self.assertAlmostEqual(rec["build"]["cost_usd_total"], 1.5)
+        self.assertEqual(rec["review"]["tokens_total"], 100)
+        self.assertAlmostEqual(rec["review"]["cost_usd_total"], 0.25)
+        self.assertAlmostEqual(rec["totals"]["cost_usd"], 1.75)
+
+    def test_parse_cost_comment_real_format(self):
+        body = (
+            "### Claude review — API cost\n\n"
+            "| Metric | Value |\n| --- | --- |\n"
+            "| Model | `claude-sonnet-4-6` |\n"
+            "| Turns | 13 |\n"
+            "| Input tokens (uncached) | 13 |\n"
+            "| Output tokens | 3,461 |\n"
+            "| Cache read tokens (0.10×) | 589,918 |\n"
+            "| Cache write tokens (1.25×) | 78,310 |\n"
+            "| **Reported cost** | **$0.5235** |\n"
+            "| Run result | `success` |\n\n"
+            "[Workflow run](https://github.com/o/r/actions/runs/123)"
+        )
+        p = L._parse_cost_comment(body)
+        self.assertEqual(p["model"], "claude-sonnet-4-6")
+        self.assertEqual(p["turns"], 13)
+        self.assertEqual(p["output_tokens"], 3461)
+        self.assertEqual(p["cache_read"], 589918)
+        self.assertEqual(p["cache_write"], 78310)
+        self.assertEqual(p["cost_usd"], 0.5235)
+        self.assertEqual(p["result"], "success")
+        self.assertEqual(p["run_url"], "https://github.com/o/r/actions/runs/123")
+
+    def test_parse_cost_comment_skips_bootstrap(self):
+        self.assertIsNone(L._parse_cost_comment("unrelated comment"))
+        self.assertIsNone(L._parse_cost_comment(
+            "### Claude review — API cost\nNo execution file was produced (review skipped)."
+        ))
+
+    def test_capture_review_dedups_by_run_url(self):
+        body = (
+            "### Claude review — API cost\n| Model | `claude-sonnet-4-6` |\n"
+            "| Output tokens | 100 |\n| **Reported cost** | **$0.50** |\n"
+            "[Workflow run](https://github.com/o/r/actions/runs/999)"
+        )
+        with patch.object(L, "_fetch_pr_comment_bodies", return_value=[body, body]):
+            rec = L.capture_review(30)
+        self.assertEqual(rec["review"]["run_count"], 1)
+        self.assertEqual(rec["review"]["cost_usd_total"], 0.50)
+
+    def test_capture_review_dedups_without_run_url(self):
+        # A cost comment with no [Workflow run] link → run_url and ts both absent.
+        # capture-review must still be idempotent via the content fingerprint.
+        body = (
+            "### Claude review — API cost\n| Model | `claude-sonnet-4-6` |\n"
+            "| Output tokens | 100 |\n| **Reported cost** | **$0.50** |\n"
+        )
+        with patch.object(L, "_fetch_pr_comment_bodies", return_value=[body, body]):
+            rec = L.capture_review(31)
+        self.assertEqual(rec["review"]["run_count"], 1)
+        # Re-running the whole capture must not duplicate either.
+        with patch.object(L, "_fetch_pr_comment_bodies", return_value=[body]):
+            rec = L.capture_review(31)
+        self.assertEqual(rec["review"]["run_count"], 1)
+
+    def test_render_report_html_contains_key_content_and_escapes(self):
+        rec = L._empty_record(7)
+        rec["title"] = "Feature <X> & Y"
+        rec["merged_at"] = "2026-06-03T06:40:36Z"
+        rec["build"]["sessions"] = [
+            {"ts": "2026-06-03T04:19:32Z", "model": "claude-opus-4-8", "tokens": 15_000_000, "cost_usd": 18.0},
+        ]
+        rec["review"]["runs"] = [
+            {"result": "success", "cost_usd": 0.5, "tokens": 400_000, "turns": 12},
+        ]
+        html = L._render_report_html([rec])
+        self.assertIn("<!doctype html>", html)
+        self.assertIn("#7", html)
+        self.assertIn("Tactical recommendations", html)
+        self.assertIn("Diagnosis", html)
+        self.assertIn("Where the effort went", html)
+        # HTML-escaped title — no raw angle brackets from user content.
+        self.assertIn("Feature &lt;X&gt; &amp; Y", html)
+        self.assertNotIn("Feature <X>", html)
+
+    def test_sync_is_tolerant_and_writes_report(self):
+        # Both capture surfaces unavailable (new branch / no comments) must not be
+        # fatal — sync still regenerates the report from committed data.
+        L.set_meta(9, title="t9", merged_at="2026-06-01T00:00:00Z")
+        L.record_build_session(9, ts="2026-01-01T00:00:00Z", tokens=1000, cost_usd=0.5, model="m")
+        out = Path(self._tmpdir.name) / "report.html"
+        with patch.object(L, "capture_build", side_effect=SystemExit("no window")), \
+             patch.object(L, "capture_review", side_effect=RuntimeError("no comments")):
+            rec = L.sync(9, repo="o/r", report_out=str(out))
+        self.assertTrue(out.is_file())
+        self.assertIn("#9", out.read_text())
+        self.assertEqual(rec["pr_number"], 9)
+
+    def test_report_writes_file_for_all_prs(self):
+        L.set_meta(3, title="t3", merged_at="2026-06-01T00:00:00Z")
+        L.record_build_session(3, ts="2026-01-01T00:00:00Z", tokens=1_000_000, cost_usd=2.0, model="claude-opus-4-8")
+        L.set_meta(4, title="t4", merged_at="2026-06-02T00:00:00Z")
+        L.record_build_session(4, ts="2026-01-02T00:00:00Z", tokens=500_000, cost_usd=1.0, model="composer-2.5")
+        out = Path(self._tmpdir.name) / "report.html"
+        self.assertEqual(L.main(["report", "--out", str(out)]), 0)
+        text = out.read_text()
+        self.assertIn("#3", text)
+        self.assertIn("#4", text)
+        self.assertEqual(text.count("<section class=\"pr\">"), 2)
+
+    def test_analyze_single_pr(self):
+        L.set_meta(20, title="t")
+        L.record_build_session(20, ts="a", tokens=1_000_000, cost_usd=1.5, model="claude-opus-4-8")
+        result = L.analyze([20])
+        self.assertEqual(len(result["reports"]), 1)
+        self.assertAlmostEqual(result["reports"][0]["build_cost_usd"], 1.5)
+        self.assertIn("1.50", result["text"])
+        self.assertEqual(result["reports"][0]["top_areas"][0]["cost_usd"], 1.5)
+
+    def test_observations_build_dominant_and_cache_read(self):
+        rec = L._empty_record(9)
+        rec["build"]["sessions"] = [
+            {
+                "ts": "a", "model": "claude-opus-4-8", "tokens": 44_000_000, "cost_usd": 30.0,
+                "input_tokens": 44, "output_tokens": 1000,
+                "cache_read_input_tokens": 40_000_000, "cache_creation_input_tokens": 0,
+            },
+        ]
+        rec["build"]["cost_usd_total"] = 30.0
+        rec["build"]["tokens_total"] = 44_000_000
+        rec["review"]["runs"] = [{"result": "success", "cost_usd": 0.5, "tokens": 500_000, "turns": 5}]
+        rec["review"]["run_count"] = 1
+        rec["review"]["cost_usd_total"] = 0.5
+        rec["totals"]["cost_usd"] = 30.5
+        obs = L._observations(rec)
+        joined = "\n".join(obs)
+        self.assertIn("Build is", joined)  # build-dominant
+        self.assertIn("Cache reads", joined)  # high cache-read pct flagged
+        self.assertIn("Model mix", joined)   # tier summary present
+
+    def test_recommendations_opus_sessions_suggest_sonnet_saving(self):
+        rec = L._empty_record(10)
+        rec["build"]["sessions"] = [
+            {
+                "ts": "2026-06-01T10:00:00Z", "model": "claude-opus-4-8", "cost_usd": 3.0,
+                "tokens": 5_000_000,
+                "input_tokens": 1000, "output_tokens": 5000,
+                "cache_read_input_tokens": 4_000_000, "cache_creation_input_tokens": 10_000,
+            },
+        ]
+        rec["build"]["cost_usd_total"] = 3.0
+        rec["build"]["tokens_total"] = 5_000_000
+        rec["review"]["runs"] = []
+        rec["review"]["run_count"] = 0
+        rec["review"]["cost_usd_total"] = 0.0
+        rec["totals"]["cost_usd"] = 3.0
+        recs = L._recommendations(rec)
+        joined = "\n".join(recs)
+        self.assertIn("Sonnet", joined)
+        self.assertIn("Est. saving", joined)
+        # Sonnet is cheaper — saving must be positive
+        saving_line = [r for r in recs if "Est. saving" in r][0]
+        self.assertIn("$", saving_line)
+
+    def test_recommendations_max_turns_and_review_run_count(self):
+        rec = L._empty_record(11)
+        rec["build"]["sessions"] = []
+        rec["build"]["cost_usd_total"] = 0.0
+        rec["build"]["tokens_total"] = 0
+        rec["review"]["runs"] = [
+            {"result": "error_max_turns", "cost_usd": 0.7},
+            {"result": "error_max_turns", "cost_usd": 0.7},
+            {"result": "success", "cost_usd": 0.7},
+        ]
+        rec["review"]["run_count"] = 3
+        rec["review"]["cost_usd_total"] = 2.1
+        rec["totals"]["cost_usd"] = 2.1
+        recs = L._recommendations(rec)
+        joined = "\n".join(recs)
+        self.assertIn("error_max_turns", joined)
+
+    def test_recompute_cost_with_token_breakdown(self):
+        session = {
+            "input_tokens": 1000, "output_tokens": 2000,
+            "cache_read_input_tokens": 500_000, "cache_creation_input_tokens": 10_000,
+        }
+        opus_cost = L._recompute_cost(session, "opus")
+        sonnet_cost = L._recompute_cost(session, "sonnet")
+        self.assertGreater(opus_cost, sonnet_cost)
+        # Verify the main term: cache_read dominates
+        expected_opus = (1000 * 5.0 + 2000 * 25.0 + 500_000 * 0.50 + 10_000 * 6.25) / 1_000_000
+        self.assertAlmostEqual(opus_cost, expected_opus, places=6)
+
+    def test_recompute_cost_fallback_no_breakdown(self):
+        session = {"tokens": 1_000_000, "cost_usd": 0.5}
+        cost = L._recompute_cost(session, "sonnet")
+        # fallback: 1M tokens × $0.30/M = $0.30
+        self.assertAlmostEqual(cost, 0.30, places=6)
+
+    def test_model_tier_mapping(self):
+        self.assertEqual(L._model_tier("claude-opus-4-8-thinking-high"), "opus")
+        self.assertEqual(L._model_tier("claude-sonnet-4-6"), "sonnet")
+        self.assertEqual(L._model_tier("claude-haiku-4-5"), "haiku")
+        self.assertEqual(L._model_tier("composer-2.5"), "composer")
+        self.assertEqual(L._model_tier(""), "composer")  # unknown → composer (cheapest bucket)
+
+    def test_bind_conversations_sets_ledger_fields(self):
+        pr = 99
+        L.set_meta(pr, session_started_at="2026-06-01T10:00:00Z")
+        rec = L.bind_conversations(pr, conversation_ids=["conv-test-uuid"])
+        self.assertEqual(rec["build"]["conversation_ids"], ["conv-test-uuid"])
+
+    def test_dedup_sessions_keeps_one_owner(self):
+        shared = {
+            "ts": "2026-06-04T03:14:12.146000+00:00",
+            "model": "claude-4.6-sonnet-medium-thinking",
+            "tokens": 1000,
+            "cost_usd": 0.9745,
+        }
+        for pr, anchor in ((21, "2026-06-04T02:00:00Z"), (23, "2026-06-04T03:10:00Z")):
+            rec = L._empty_record(pr)
+            rec["pr_number"] = pr
+            rec["session_started_at"] = anchor
+            rec["build"]["sessions"] = [dict(shared)]
+            L.save_record(rec)
+        result = L.dedup_sessions()
+        self.assertEqual(result["duplicates"], 1)
+        owners = []
+        for pr in (21, 23):
+            sessions = L.load_record(pr)["build"]["sessions"]
+            if sessions:
+                owners.append(pr)
+        self.assertEqual(owners, [23])
+
+    def test_validate_flags_cross_pr_duplicate_sessions(self):
+        sess = {"ts": "2026-06-01T12:00:00Z", "model": "m", "tokens": 1, "cost_usd": 1.0}
+        for pr in (40, 41):
+            L.set_meta(pr, title=f"t{pr}", requirement="r")
+            rec = L.load_record(pr)
+            rec["build"]["sessions"] = [dict(sess)]
+            L.save_record(rec)
+        ok, problems = L.validate(40)
+        self.assertFalse(ok)
+        self.assertTrue(any("PR 41" in p for p in problems))
+
+    def test_merged_only_report_excludes_closed_pr(self):
+        merged = L._empty_record(50)
+        merged["pr_number"] = 50
+        merged["title"] = "merged"
+        merged["merged_at"] = "2026-06-01T00:00:00Z"
+        L.save_record(merged)
+        closed = L._empty_record(51)
+        closed["pr_number"] = 51
+        closed["title"] = "closed"
+        closed["merged_at"] = None
+        L.save_record(closed)
+        with patch.object(L, "_fetch_gh_pr_meta", return_value={"state": "CLOSED", "merged_at": None}):
+            records = L._records_for_report()
+        self.assertEqual([r["pr_number"] for r in records], [50])
+
+    def test_report_persists_confirmed_merge_and_is_sticky(self):
+        """A merged PR missing local merged_at is included AND backfilled, so a
+        later regeneration with NO GitHub access still reports it (regression:
+        merged PRs intermittently dropped out when the live lookup was flaky)."""
+        rec = L._empty_record(52)
+        rec["pr_number"] = 52
+        rec["title"] = "needs gh confirm"
+        rec["merged_at"] = None
+        L.save_record(rec)
+        meta = {"state": "MERGED", "merged_at": "2026-06-03T00:00:00Z", "title": "needs gh confirm"}
+        with patch.object(L, "_fetch_gh_pr_meta", return_value=meta):
+            first = L._records_for_report()
+        self.assertEqual([r["pr_number"] for r in first], [52])
+        # merged_at is now persisted on disk
+        self.assertEqual(L.load_record(52)["merged_at"], "2026-06-03T00:00:00Z")
+        # Sticky: a second pass with the lookup unavailable still includes it
+        with patch.object(L, "_fetch_gh_pr_meta", return_value=None):
+            second = L._records_for_report()
+        self.assertEqual([r["pr_number"] for r in second], [52])
+
+    def test_backfill_titles_from_gh(self):
+        L.set_meta(60, title=None, branch=None)
+        with patch.object(
+            L, "_fetch_gh_pr_meta",
+            return_value={
+                "title": "From GitHub",
+                "branch": "feat/x",
+                "created_at": "2026-06-01T00:00:00Z",
+                "merged_at": "2026-06-02T00:00:00Z",
+                "state": "MERGED",
+            },
+        ):
+            updated = L.backfill_titles(prs=[60])
+        self.assertEqual(updated, [60])
+        rec = L.load_record(60)
+        self.assertEqual(rec["title"], "From GitHub")
+        self.assertEqual(rec["branch"], "feat/x")
+
+    def test_validate_rejects_wide_manual_window(self):
+        pr = 98
+        L.set_meta(pr, title="t", requirement="r")
+        L.record_build_session(pr, ts="2026-06-01T12:00:00Z", tokens=100, cost_usd=0.1, model="m")
+        rec = L.load_record(pr)
+        rec["build"]["attribution_mode"] = "manual_window"
+        rec["build"]["approximate"] = False
+        rec["build"]["window"] = {
+            "start": "2026-06-01T00:00:00Z",
+            "end": "2026-06-02T00:00:00Z",
+        }
+        L.save_record(rec)
+        ok, issues = L.validate(pr)
+        self.assertFalse(ok)
+        self.assertTrue(any("parallel chat" in i.lower() for i in issues))
+
+    def test_capture_build_hard_fails_on_zero(self):
+        """capture-build must raise SystemExit if the window yields $0 cost."""
+        L.set_meta(200, title="t", requirement="r", branch="feat/zero")
+        with patch("cursor_usage.fetch_usage_events", return_value=[]):
+            with patch("cursor_usage.derive_window_for_branch", return_value=(0, 9999)):
+                with patch("cursor_usage.git_branch_commit_range_ms", return_value=(0, 9999)):
+                    with self.assertRaises(SystemExit) as ctx:
+                        L.capture_build(200)
+        self.assertIn("HARD failure", str(ctx.exception))
+
+    def test_validate_require_build_rejects_zero_cost(self):
+        """validate --require-build must fail if build cost is $0."""
+        L.set_meta(201, title="t", requirement="r")
+        # Record a session with zero cost
+        L.record_build_session(201, ts="2026-06-01T00:00:00Z",
+                               tokens=0, cost_usd=0.0, model="m")
+        ok, problems = L.validate(201, require_build=True)
+        self.assertFalse(ok)
+        self.assertTrue(any("$0" in p for p in problems))
+
+
+if __name__ == "__main__":
+    unittest.main()

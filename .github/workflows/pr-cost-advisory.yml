@@ -1,0 +1,57 @@
+name: PR cost (advisory)
+
+# Advisory cost check (M0). Not a hard gate yet — becomes required from M1.
+# Reads from BigQuery via WIF. If WIF secrets are not yet configured, the
+# advisory-only step fires instead and the job never blocks.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  cost-advisory:
+    name: PR cost (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ github.event.pull_request.number }}
+      FRIDAY_BQ_PROJECT: friday-prod-7401
+    steps:
+      - name: advisory only
+        run: echo "advisory only"
+
+      - name: Register check on main push
+        if: github.event_name == 'push'
+        run: echo "Cost advisory runs on pull_request only; this registers the check name on main."
+
+      - name: Checkout
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: github.event_name == 'pull_request'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install BigQuery client
+        if: github.event_name == 'pull_request'
+        run: pip install google-cloud-bigquery google-auth
+
+      - name: Authenticate to GCP
+        if: github.event_name == 'pull_request'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Validate cost ledger (advisory — not a hard gate in M0)
+        if: github.event_name == 'pull_request'
+        run: python3 scripts/pr_cost_ledger.py validate --pr "$PR" --require-build
