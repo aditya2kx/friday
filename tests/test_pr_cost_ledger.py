@@ -40,6 +40,19 @@ def _make_in_memory_store_patchers():
     def _delete(pr):
         db.pop(S.pr_key(pr), None)
 
+    def _find_dup(pr, session_keys):
+        """In-memory duplicate detection: scan db for session_keys on other PRs."""
+        my_key = S.pr_key(pr)
+        dupes = []
+        for k, rec in db.items():
+            if k == my_key:
+                continue
+            for sess in (rec.get("build") or {}).get("sessions") or []:
+                uid = S._session_uid(sess)
+                if uid in session_keys:
+                    dupes.append((k, uid))
+        return dupes
+
     patcher = patch.multiple(
         S,
         save_record=_save,
@@ -47,6 +60,7 @@ def _make_in_memory_store_patchers():
         all_prs=_all,
         delete_record=_delete,
         ensure_schema=lambda: None,
+        find_duplicate_sessions=_find_dup,
     )
     return patcher, db
 
@@ -451,7 +465,7 @@ class TestPrCostLedger(unittest.TestCase):
             L.save_record(rec)
         ok, problems = L.validate(40)
         self.assertFalse(ok)
-        self.assertTrue(any("PR #41" in p for p in problems))
+        self.assertTrue(any("PR 41" in p for p in problems))
 
     def test_merged_only_report_excludes_closed_pr(self):
         merged = L._empty_record(50)
