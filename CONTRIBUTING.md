@@ -15,9 +15,9 @@ Agents never merge (Constitution art. 2). Branch naming: `<topic>-<short-descrip
 ## 2. The decision document is the review
 
 Fill every field in `.github/pull_request_template.md`. Evidence, not promises.
-Missing or empty fields fail CI (`scripts/check_decision_doc.py`). The 9-field
-decision document is the mechanism — it captures risk, intent, evidence, and blast radius
-so the operator can approve or redirect in one read.
+Missing or empty fields fail CI (`scripts/check_decision_doc.py`). **§3 must list
+every file in the PR diff** (`scripts/check_pr_body_fidelity.py`) — update the
+description whenever you push new commits.
 
 ## 3. Cost tracking (M1 — not yet a CI gate)
 
