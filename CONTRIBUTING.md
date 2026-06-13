@@ -8,6 +8,10 @@ Agents never merge (Constitution art. 2). Branch naming: `<topic>-<short-descrip
 **PR authorship:** agents open PRs as `jarvis-agent-bot328` (bot PAT). The operator
 (`aditya2kx`) reviews and approves — never author your own PR.
 
+**Merge gate (tier-aware):** required CI check `merge-gate` enforces Constitution art. 2.
+- **Tier 0** (docs/progress only): merge unlocks when CI is green — no approval required.
+- **Tier 1/2**: merge stays blocked until the operator approves. Squash and merge is disabled server-side until `merge-gate` passes.
+
 ## 2. The decision document is the review
 
 Fill every field in `.github/pull_request_template.md`. Evidence, not promises.

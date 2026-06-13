@@ -14,7 +14,7 @@ on:
   pull_request:
     types: [synchronize, ready_for_review]
   workflow_run:
-    workflows: ["Tests", "Decision document"]
+    workflows: ["Tests", "Decision document", "Merge gate"]
     types: [completed]
 
 permissions:
@@ -60,20 +60,37 @@ jobs:
               ;;
           esac
 
-      - name: Require operator approval
+      - name: Require operator approval (Tier 1+ only)
         id: approved
         if: steps.pr.outputs.number != ''
         run: |
           PR="${{ steps.pr.outputs.number }}"
+          BODY=$(gh pr view "$PR" --repo "$REPO" --json body -q .body)
+          TIER=$(echo "$BODY" | python3 -c "
+          import re, sys
+          body = sys.stdin.read()
+          m = re.search(r'^##\s*1\.\s*Risk tier\s*$', body, re.I|re.M)
+          text = body[m.end():] if m else ''
+          n = re.search(r'^##\s*\d+\.', text, re.M)
+          text = text[:n.start()] if n else text
+          t = re.search(r'\btier\s*([012])\b', text, re.I)
+          print(t.group(1) if t else '1')
+          ")
+          echo "tier=$TIER" >> "$GITHUB_OUTPUT"
+          if [ "$TIER" = "0" ]; then
+            echo "approved=true" >> "$GITHUB_OUTPUT"
+            echo "Tier 0 — operator approval not required."
+            exit 0
+          fi
           COUNT=$(gh pr view "$PR" --repo "$REPO" --json reviews \
             --jq --arg op "$OPERATOR" \
             '[.reviews[] | select(.author.login == $op and .state == "APPROVED")] | length')
           if [ "$COUNT" -gt 0 ]; then
             echo "approved=true" >> "$GITHUB_OUTPUT"
-            echo "Operator has approved PR #$PR."
+            echo "Tier $TIER — operator has approved PR #$PR."
           else
             echo "approved=false" >> "$GITHUB_OUTPUT"
-            echo "No operator approval on PR #$PR — skipping."
+            echo "Tier $TIER — waiting for operator approval on PR #$PR."
           fi
 
       - name: Enable auto-merge (squash)

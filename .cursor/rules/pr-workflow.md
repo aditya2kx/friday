@@ -40,4 +40,5 @@ Do NOT ask whether to babysit — just do it.
 
 - Cost gate is **M1** — no cost CI in M0.1
 - PRs must be authored by `jarvis-agent-bot328`; operator (`aditya2kx`) approves
+- `merge-gate` required check: Tier 1/2 blocked until operator approval; Tier 0 merges on green CI alone
 - Always resolve `CHANGES_REQUESTED` reviews — reply if the concern is already addressed on the branch
