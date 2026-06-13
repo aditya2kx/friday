@@ -1,0 +1,22 @@
+name: Doc Freshness
+
+# Flags (does not block merge - not a required check) when a code change lands
+# without its coupled doc. Constitution art. 5 made mechanical.
+on:
+  pull_request:
+
+jobs:
+  check:
+    name: Doc Freshness
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check doc freshness
+        run: python3 scripts/check_doc_freshness.py --base "${{ github.event.pull_request.base.sha }}" --strict
