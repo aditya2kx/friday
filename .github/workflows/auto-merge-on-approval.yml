@@ -82,9 +82,8 @@ jobs:
             echo "Tier 0 — operator approval not required."
             exit 0
           fi
-          COUNT=$(gh pr view "$PR" --repo "$REPO" --json reviews \
-            --jq --arg op "$OPERATOR" \
-            '[.reviews[] | select(.author.login == $op and .state == "APPROVED")] | length')
+          COUNT=$(gh pr view "$PR" --repo "$REPO" --json reviews -q \
+            "[.reviews[] | select(.author.login == \"$OPERATOR\" and .state == \"APPROVED\")] | length")
           if [ "$COUNT" -gt 0 ]; then
             echo "approved=true" >> "$GITHUB_OUTPUT"
             echo "Tier $TIER — operator has approved PR #$PR."
