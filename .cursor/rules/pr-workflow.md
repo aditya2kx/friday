@@ -21,7 +21,7 @@ Do NOT ask whether to babysit — just do it.
    - Wait for CI; fix any failures within this PR's scope
    - Triage review comments (Claude review bot + Adi's comments)
    - Loop until all checks are green and no open blocking comments remain
-5. **Arm auto-merge** → Arm auto-merge ONLY via operator approval or Tier-0 policy. The agent itself never merges (Constitution art. 2).
+5. **Arm auto-merge** → Operator approval arms it via `auto-merge-on-approval.yml` (also re-arms when CI finishes or the PR base updates — no laptop `gh pr merge` needed). The agent itself never merges (Constitution art. 2).
 6. **Confirm merged** → verify `state == MERGED` before ending the session
 7. **Post-merge pull + verify** — after confirmed merged:
    - Pull the working copy to bring the squash commit in.
