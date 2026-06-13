@@ -5,6 +5,9 @@
 Every change lands via a pull request. Never push directly to `main` (Constitution art. 1).
 Agents never merge (Constitution art. 2). Branch naming: `<topic>-<short-description>`.
 
+**PR authorship:** agents open PRs as `jarvis-agent-bot328` (bot PAT). The operator
+(`aditya2kx`) reviews and approves — never author your own PR.
+
 ## 2. The decision document is the review
 
 Fill every field in `.github/pull_request_template.md`. Evidence, not promises.
@@ -12,21 +15,18 @@ Missing or empty fields fail CI (`scripts/check_decision_doc.py`). The 9-field
 decision document is the mechanism — it captures risk, intent, evidence, and blast radius
 so the operator can approve or redirect in one read.
 
-## 3. Cost tracking
+## 3. Cost tracking (M1 — not yet a CI gate)
 
-Install the pre-commit hook once per clone:
+Cost attribution scripts (`scripts/pr_cost_ledger.py`, `pr_cost_store.py`) and the
+pre-commit hook are present for M1. **No cost workflow runs in CI until M1** — do not
+add `pr-cost-advisory` or `pr-cost-finalize` checks before the ledger is seeded and
+the gate is required.
+
+When M1 lands, install the hook once per clone:
 
 ```bash
 bash scripts/install-git-hooks.sh
 ```
-
-Seed the cost ledger after creating a PR:
-
-```bash
-python scripts/pr_cost_ledger.py set-meta --pr <N> --branch <branch>
-```
-
-Cost ledger lives in BigQuery (`$FRIDAY_PROJECT.friday_dev`). Zero build cost is a hard failure.
 
 ## 4. Executor protocol
 
