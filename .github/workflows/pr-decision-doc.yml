@@ -4,8 +4,12 @@ on:
     types: [opened, edited, synchronize, reopened]
 jobs:
   check:
+    name: check
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    concurrency:
+      group: decision-doc-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
         with:
