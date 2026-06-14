@@ -1,29 +1,123 @@
 name: Auto-merge on approval
 
-# When the OPERATOR approves a PR, arm auto-merge so GitHub merges it once all
-# required checks are green. This is the Constitution art. 2 mechanism: the
-# merge authority is the operator's approval; this workflow is plumbing.
+# Constitution art. 2: operator approval arms squash auto-merge once required checks pass.
+#
+# Triggers (no laptop needed):
+#   1. pull_request_review submitted — operator approves → arm immediately
+#   2. workflow_run — required CI finished on a PR branch → re-arm if already approved
+#      (covers approval-before-checks-green and base-branch updates after approval)
+#   3. pull_request synchronize / ready_for_review — base updated or draft → ready → re-arm
 
 on:
   pull_request_review:
     types: [submitted]
+  pull_request:
+    types: [synchronize, ready_for_review]
+  workflow_run:
+    workflows: ["Tests", "Decision document", "Merge gate"]
+    types: [completed]
 
 permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: auto-merge-${{ github.event.pull_request.number || github.event.workflow_run.head_branch || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   auto-merge:
     name: Arm auto-merge
-    if: github.event.review.state == 'APPROVED' && github.event.review.user.login == 'aditya2kx'
+    if: |
+      github.event_name != 'pull_request_review' ||
+      (github.event.review.state == 'APPROVED' && github.event.review.user.login == 'aditya2kx')
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.BOT_PAT }}
-      PR: ${{ github.event.pull_request.number }}
       REPO: ${{ github.repository }}
+      OPERATOR: aditya2kx
     steps:
-      - name: Enable auto-merge (squash)
+      - name: Resolve PR number
+        id: pr
         run: |
+          case "${{ github.event_name }}" in
+            pull_request_review|pull_request)
+              echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+              ;;
+            workflow_run)
+              BRANCH="${{ github.event.workflow_run.head_branch }}"
+              if [ "${{ github.event.workflow_run.event }}" != "pull_request" ]; then
+                echo "Workflow run was not from a pull_request — skipping."
+                exit 0
+              fi
+              PR_NUM=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+                --json number --jq '.[0].number // empty')
+              if [ -z "$PR_NUM" ]; then
+                echo "No open PR for branch $BRANCH — skipping."
+                exit 0
+              fi
+              echo "number=$PR_NUM" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Require operator approval (Tier 1+ only)
+        id: approved
+        if: steps.pr.outputs.number != ''
+        run: |
+          PR="${{ steps.pr.outputs.number }}"
+          BODY=$(gh pr view "$PR" --repo "$REPO" --json body -q .body)
+          TIER=$(echo "$BODY" | python3 -c "
+          import re, sys
+          body = sys.stdin.read()
+          m = re.search(r'^##\s*1\.\s*Risk tier\s*$', body, re.I|re.M)
+          text = body[m.end():] if m else ''
+          n = re.search(r'^##\s*\d+\.', text, re.M)
+          text = text[:n.start()] if n else text
+          t = re.search(r'\btier\s*([012])\b', text, re.I)
+          print(t.group(1) if t else '1')
+          ")
+          echo "tier=$TIER" >> "$GITHUB_OUTPUT"
+          if [ "$TIER" = "0" ]; then
+            echo "approved=true" >> "$GITHUB_OUTPUT"
+            echo "Tier 0 — operator approval not required."
+            exit 0
+          fi
+          COUNT=$(gh pr view "$PR" --repo "$REPO" --json reviews -q \
+            "[.reviews[] | select(.author.login == \"$OPERATOR\" and .state == \"APPROVED\")] | length")
+          if [ "$COUNT" -gt 0 ]; then
+            echo "approved=true" >> "$GITHUB_OUTPUT"
+            echo "Tier $TIER — operator has approved PR #$PR."
+          else
+            echo "approved=false" >> "$GITHUB_OUTPUT"
+            echo "Tier $TIER — waiting for operator approval on PR #$PR."
+          fi
+
+      - name: Enable auto-merge (squash)
+        if: steps.approved.outputs.approved == 'true'
+        run: |
+          PR="${{ steps.pr.outputs.number }}"
+          INFO=$(gh pr view "$PR" --repo "$REPO" \
+            --json state,isDraft,autoMergeRequest,mergeable,mergeStateStatus)
+          STATE=$(echo "$INFO" | jq -r '.state')
+          DRAFT=$(echo "$INFO" | jq -r '.isDraft')
+          ARMED=$(echo "$INFO" | jq -r '.autoMergeRequest != null')
+          MERGEABLE=$(echo "$INFO" | jq -r '.mergeable')
+          STATUS=$(echo "$INFO" | jq -r '.mergeStateStatus')
+
+          echo "PR #$PR: state=$STATE draft=$DRAFT armed=$ARMED mergeable=$MERGEABLE status=$STATUS"
+
+          if [ "$STATE" != "OPEN" ]; then
+            echo "PR is not open — skipping."
+            exit 0
+          fi
+          if [ "$DRAFT" = "true" ]; then
+            echo "PR is a draft — skipping."
+            exit 0
+          fi
+          if [ "$ARMED" = "true" ]; then
+            echo "Auto-merge already armed on PR #$PR."
+            exit 0
+          fi
+
           gh pr merge "$PR" --auto --squash --repo "$REPO" && \
-            echo "Auto-merge armed on PR #$PR — merges once required checks pass." || \
-            echo "::warning::Could not arm auto-merge on PR #$PR (already merged or draft?)."
+            echo "Auto-merge armed on PR #$PR — merges once required checks pass."

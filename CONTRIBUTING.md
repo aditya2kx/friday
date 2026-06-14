@@ -8,12 +8,16 @@ Agents never merge (Constitution art. 2). Branch naming: `<topic>-<short-descrip
 **PR authorship:** agents open PRs as `jarvis-agent-bot328` (bot PAT). The operator
 (`aditya2kx`) reviews and approves — never author your own PR.
 
+**Merge gate (tier-aware):** required CI check `merge-gate` enforces Constitution art. 2.
+- **Tier 0** (docs/progress only): merge unlocks when CI is green — no approval required.
+- **Tier 1/2**: merge stays blocked until the operator approves. Squash and merge is disabled server-side until `merge-gate` passes.
+
 ## 2. The decision document is the review
 
 Fill every field in `.github/pull_request_template.md`. Evidence, not promises.
-Missing or empty fields fail CI (`scripts/check_decision_doc.py`). The 9-field
-decision document is the mechanism — it captures risk, intent, evidence, and blast radius
-so the operator can approve or redirect in one read.
+Missing or empty fields fail CI (`scripts/check_decision_doc.py`). **§3 must list
+every file in the PR diff** (`scripts/check_pr_body_fidelity.py`) — update the
+description whenever you push new commits.
 
 ## 3. Cost tracking (M1 — not yet a CI gate)
 

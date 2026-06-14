@@ -1,0 +1,35 @@
+name: Merge gate
+
+# Tier-aware server-side merge lock (Constitution art. 2, R6).
+# Tier 0: passes on green CI alone. Tier 1/2: requires operator approval.
+# Required status check — disables Squash and merge until this is green.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+jobs:
+  merge-gate:
+    name: merge-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: merge-gate-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check tier + operator approval
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: python3 scripts/check_merge_gate.py --body "$PR_BODY" --pr "$PR" --repo "$REPO"

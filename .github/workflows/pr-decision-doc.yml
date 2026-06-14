@@ -4,12 +4,24 @@ on:
     types: [opened, edited, synchronize, reopened]
 jobs:
   check:
+    name: check
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    concurrency:
+      group: decision-doc-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with: {python-version: "3.12"}
-      - env:
+      - name: 9-field decision document
+        env:
           PR_BODY: ${{ github.event.pull_request.body }}
-        run: python scripts/check_decision_doc.py --body "$PR_BODY"
+        run: python3 scripts/check_decision_doc.py --body "$PR_BODY"
+      - name: §3 covers all changed files
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python3 scripts/check_pr_body_fidelity.py --body "$PR_BODY" --base "$BASE_SHA"
